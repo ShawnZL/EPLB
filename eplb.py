@@ -14,6 +14,7 @@ def balanced_packing(weight: torch.Tensor, num_packs: int) -> Tuple[torch.Tensor
     Returns: 
         pack_index: [X, n], the pack index of each item
         rank_in_pack: [X, n], the rank of the item in the pack
+    # 在
     """
 
     num_layers, num_groups = weight.shape
@@ -22,9 +23,11 @@ def balanced_packing(weight: torch.Tensor, num_packs: int) -> Tuple[torch.Tensor
 
     if groups_per_pack == 1:
         pack_index = torch.arange(weight.size(-1), dtype=torch.int64, device=weight.device).expand(weight.shape)
+        # 每一个pack一个expert 所有rank都是0
         rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
         return pack_index, rank_in_pack
 
+    # 根据weight最后一个维度降序排列并返回索引，也就是expert 按照权重排序
     indices = weight.float().sort(-1, descending=True).indices.cpu()
     pack_index = torch.full_like(weight, fill_value=-1, dtype=torch.int64, device='cpu')
     rank_in_pack = torch.full_like(pack_index, fill_value=-1)
@@ -43,7 +46,6 @@ def balanced_packing(weight: torch.Tensor, num_packs: int) -> Tuple[torch.Tensor
 
 
 def replicate_experts(weight: torch.Tensor, num_phy: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
     """
     Replicate `num_log` experts to `num_phy` replicas, such that the maximum load of all replicas is minimized.
 
@@ -56,28 +58,36 @@ def replicate_experts(weight: torch.Tensor, num_phy: int) -> Tuple[torch.Tensor,
         rank: [X, num_phy], the replica rank
         logcnt: [X, num_log], number of replicas for each logical expert
     """
-    n, num_log = weight.shape
-    num_redundant = num_phy - num_log
+
+    num_layers, num_experts = weight.shape
+    num_redundant = num_phy - num_experts
     assert num_redundant >= 0
     device = weight.device
-    phy2log = torch.arange(num_phy, dtype=torch.int64, device=device).repeat(n, 1)
-    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
-    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
-    arangen = torch.arange(n, dtype=torch.int64, device=device)
-    for i in range(num_log, num_phy):
-        redundant_indices = (weight / logcnt).max(dim=-1).indices
+    # [num_layers, num_experts] 0 - num_layers-1
+    phy2log = torch.arange(num_phy, dtype=torch.int64, device=device).repeat(num_layers, 1)
+    rank = torch.zeros(num_layers, num_phy, dtype=torch.int64, device=device)
+    # 每一个专家复制的个数
+    expertcnt = torch.ones(num_layers, num_experts, dtype=torch.int64, device=device)
+    # 索引 0 - num_layers-1
+    arangen = torch.arange(num_layers, dtype=torch.int64, device=device)
+    for i in range(num_experts, num_phy):
+        # weight / cnt     choose max for duplicate expert.indice 返回每一层的最大值索引
+        # 在没有加之前，为每一个新增专家分配之前cnt作为rank
+        redundant_indices = (weight / expertcnt).max(dim=-1).indices
+        # 将第i个作为专家的索引
         phy2log[:, i] = redundant_indices
-        rank[:, i] = logcnt[arangen, redundant_indices]
-        logcnt[arangen, redundant_indices] += 1
-    return phy2log, rank, logcnt
+        # 需要为第i个专家分配副本排名
+        rank[:, i] = expertcnt[arangen, redundant_indices]
+        expertcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, expertcnt
 
 
-def rebalance_experts_hierarchical(weight: torch.Tensor, num_physical_experts: int, 
+def rebalance_experts_hierarchical(weight: torch.Tensor, num_phy_experts: int,
                       num_groups: int, num_nodes: int, num_gpus: int):
     """
     Parameters:
         weight: [num_moe_layers, num_logical_experts]
-        num_physical_experts: number of physical experts after replication
+        num_phy_experts: number of physical experts after replication
         num_groups: number of expert groups
         num_nodes: number of server nodes, where the intra-node network (e.g, NVLink) is faster
         num_gpus: number of GPUs, must be a multiple of `num_nodes`
@@ -87,14 +97,14 @@ def rebalance_experts_hierarchical(weight: torch.Tensor, num_physical_experts: i
         logical_to_physical_map: [num_moe_layers, num_logical_experts, X]
         logical_count: [num_moe_layers, num_logical_experts]
     """
-    num_layers, num_logical_experts = weight.shape
-    assert num_logical_experts % num_groups == 0
-    group_size = num_logical_experts // num_groups 
+    num_layers, num_experts = weight.shape
+    assert num_experts % num_groups == 0
+    group_size = num_experts // num_groups
     assert num_groups % num_nodes == 0
     groups_per_node = num_groups // num_nodes
     assert num_gpus % num_nodes == 0
-    assert num_physical_experts % num_gpus == 0
-    phy_experts_per_gpu = num_physical_experts // num_gpus
+    assert num_phy_experts % num_gpus == 0
+    phy_experts_per_gpu = num_phy_experts // num_gpus
 
     def inverse(perm: torch.Tensor) -> torch.Tensor:
         inv = torch.empty_like(perm)
@@ -110,8 +120,8 @@ def rebalance_experts_hierarchical(weight: torch.Tensor, num_physical_experts: i
 
     # Step 2: construct redundant experts within nodes
     # [num_layers * num_nodes, num_logical_experts // num_nodes]
-    tokens_per_mlog = weight.gather(-1, mlog2log).view(-1, num_logical_experts // num_nodes)
-    phy2mlog, phyrank, mlogcnt = replicate_experts(tokens_per_mlog, num_physical_experts // num_nodes)    
+    tokens_per_mlog = weight.gather(-1, mlog2log).view(-1, num_experts // num_nodes)
+    phy2mlog, phyrank, mlogcnt = replicate_experts(tokens_per_mlog, num_phy_experts // num_nodes)
 
     # Step 3: pack physical_experts to GPUs
     # [num_layers * num_nodes, num_physical_experts // num_nodes]
@@ -122,7 +132,7 @@ def rebalance_experts_hierarchical(weight: torch.Tensor, num_physical_experts: i
 
     pphy2mlog = phy2mlog.gather(-1, pphy2phy) # [num_layers * num_nodes, num_log_per_nodes]
     pphy2mlog = (pphy2mlog.view(num_layers, num_nodes, -1) + 
-                 torch.arange(0, num_logical_experts, num_logical_experts // num_nodes).view(1, -1, 1)).flatten(-2)
+                 torch.arange(0, num_experts, num_experts // num_nodes).view(1, -1, 1)).flatten(-2)
     pphy2log = mlog2log.gather(-1, pphy2mlog)
     pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
     logcnt = mlogcnt.view(num_layers, -1).gather(-1, log2mlog)
