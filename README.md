@@ -128,8 +128,6 @@ weight = torch.tensor([[10.0, 20.0, 30.0],
 
 expertcnt = torch.tensor([[1, 2, 1],
                           [2, 1, 1]])
-
-﻿
 ```
 
 计算`weight / expertcnt`得到：
@@ -138,15 +136,12 @@ expertcnt = torch.tensor([[1, 2, 1],
 [[10.0, 10.0, 30.0],
  [7.5, 25.0, 35.0]]
 
-﻿
 ```
 
 然后，`.max(dim=-1).indices`计算结果为：
 
 ```plain
 [2, 2]
-
-﻿
 ```
 
 这意味着：
@@ -215,10 +210,6 @@ expertcnt[arangen, redundant_indices]
 ### 总结
 
 因此，`expertcnt[arangen, redundant_indices]` 使用高级索引机制，通过 `arangen` 和 `redundant_indices` 的组合来选择 `expertcnt` 中的特定元素，并将这些元素赋值给 `rank` 张量的相应位置。
-
-﻿
-
-﻿
 
 ## 3. `rebalance_experts_hierarchical` 函数
 
@@ -298,5 +289,13 @@ def rebalance_experts(weight: torch.Tensor, num_replicas: int, num_groups: int,
 3. **专家复制**: 通过复制高负载专家来分散计算压力
 4. **层次化分配**: 先将专家组分配到节点，再在节点内分配到GPU，减少跨节点通信
 
-这种设计特别适合大规模分布式训练环境，可以有效减少通信瓶颈并提高硬件利用率。
+# 疑惑
+
+为什么全局部分就是直接复制这部分专家
+
+```
+    else:
+        # use global load-balance policy
+        phy2log, phyrank, logcnt = replicate_experts(weight, num_replicas)
+```
 
